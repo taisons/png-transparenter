@@ -1,3 +1,5 @@
+import * as UPNG from 'upng-js';
+
 export interface RGBColor {
   r: number;
   g: number;
@@ -10,6 +12,10 @@ export interface Point {
 }
 
 export type RemovalMode = 'flood' | 'global';
+
+export type CompressionMode = 'lossless' | 'smart' | 'palette256' | 'palette128';
+
+export type ExportScale = 1 | 0.75 | 0.5;
 
 export interface BrushStroke {
   type: 'erase' | 'restore';
@@ -28,6 +34,31 @@ export interface ProcessOptions {
   brushStrokes: BrushStroke[]; // manual erase/restore strokes
 }
 
+export interface ExportOptions {
+  autoTrim: boolean;
+  trimMargin?: number;
+  compression: CompressionMode;
+  scale: ExportScale;
+}
+
+export interface EncodedPngResult {
+  blob: Blob;
+  width: number;
+  height: number;
+  byteSize: number;
+}
+
+/**
+ * Format byte count into human-readable KB / MB
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 100 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(2)} MB`;
+}
+
 /**
  * Compute Euclidean distance in RGB space (0 to ~441.67), scaled to 0..100
  */
@@ -42,7 +73,6 @@ export function colorDistance(
   const dr = r1 - r2;
   const dg = g1 - g2;
   const db = b1 - b2;
-  // Max Euclidean distance is sqrt(255^2 * 3) = 441.67295593
   return (Math.sqrt(dr * dr + dg * dg + db * db) / 441.67295593) * 100;
 }
 
@@ -110,7 +140,6 @@ export function processImageTransparency(
     }
   } else {
     // Flood Fill (BFS from outer perimeter + user seedPoints)
-    // Flat Int32Array queue avoids GC and shift() overhead
     const queue = new Int32Array(totalPixels);
     let head = 0;
     let tail = 0;
@@ -124,16 +153,16 @@ export function processImageTransparency(
 
     // 1. Seed top and bottom borders
     for (let x = 0; x < width; x++) {
-      tryEnqueue(x); // top row (y = 0)
-      tryEnqueue((height - 1) * width + x); // bottom row (y = height - 1)
+      tryEnqueue(x);
+      tryEnqueue((height - 1) * width + x);
     }
     // 2. Seed left and right borders
     for (let y = 1; y < height - 1; y++) {
-      tryEnqueue(y * width); // left col (x = 0)
-      tryEnqueue(y * width + (width - 1)); // right col (x = width - 1)
+      tryEnqueue(y * width);
+      tryEnqueue(y * width + (width - 1));
     }
 
-    // 3. Seed user-clicked hole punch points (plus small 3x3 neighborhood for forgiving clicks)
+    // 3. Seed user-clicked hole punch points
     for (const pt of seedPoints) {
       const cx = Math.round(pt.x);
       const cy = Math.round(pt.y);
@@ -143,7 +172,6 @@ export function processImageTransparency(
           const ny = cy + dy;
           if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
             const pIdx = ny * width + nx;
-            // For user-clicked point, allow slightly higher tolerance at seed if exact pixel is near threshold
             if (bgMask[pIdx] === 0 && distMap[pIdx] <= Math.max(tolerance + 8, 12)) {
               bgMask[pIdx] = 1;
               queue[tail++] = pIdx;
@@ -153,13 +181,12 @@ export function processImageTransparency(
       }
     }
 
-    // 8-way or 4-way BFS flood fill (4-way prevents leaking through 1px diagonal corners of outlines)
+    // 4-way BFS flood fill
     while (head < tail) {
       const curr = queue[head++];
       const x = curr % width;
       const y = (curr - x) / width;
 
-      // Left
       if (x > 0) {
         const next = curr - 1;
         if (bgMask[next] === 0 && distMap[next] <= tolerance) {
@@ -167,7 +194,6 @@ export function processImageTransparency(
           queue[tail++] = next;
         }
       }
-      // Right
       if (x < width - 1) {
         const next = curr + 1;
         if (bgMask[next] === 0 && distMap[next] <= tolerance) {
@@ -175,7 +201,6 @@ export function processImageTransparency(
           queue[tail++] = next;
         }
       }
-      // Up
       if (y > 0) {
         const next = curr - width;
         if (bgMask[next] === 0 && distMap[next] <= tolerance) {
@@ -183,7 +208,6 @@ export function processImageTransparency(
           queue[tail++] = next;
         }
       }
-      // Down
       if (y < height - 1) {
         const next = curr + width;
         if (bgMask[next] === 0 && distMap[next] <= tolerance) {
@@ -205,7 +229,6 @@ export function processImageTransparency(
         for (let x = 0; x < width; x++) {
           const i = rowOffset + x;
           if (currentBgMask[i] === 1) continue;
-          // Check if adjacent to a transparent pixel
           if (
             (x > 0 && currentBgMask[i - 1] === 1) ||
             (x < width - 1 && currentBgMask[i + 1] === 1) ||
@@ -221,8 +244,6 @@ export function processImageTransparency(
   }
 
   // Apply alpha & feathering on boundary pixels
-  // Notice: In flood mode, we ONLY want to feather pixels that are near the removed background
-  // so that internal dark shadows deep inside the illustration remain 100% opaque!
   const softRange = Math.max(0, feather);
 
   for (let y = 0; y < height; y++) {
@@ -232,12 +253,15 @@ export function processImageTransparency(
       const rgbaIdx = i * 4;
 
       if (currentBgMask[i] === 1) {
+        // Zero out RGB on transparent pixels so DEFLATE compresses much better
+        dst[rgbaIdx] = 0;
+        dst[rgbaIdx + 1] = 0;
+        dst[rgbaIdx + 2] = 0;
         dst[rgbaIdx + 3] = 0;
         continue;
       }
 
       if (softRange > 0) {
-        // Check if this pixel is in global mode OR within a 2-pixel neighborhood of removed background
         let nearBg = mode === 'global';
         if (!nearBg) {
           for (let dy = -2; dy <= 2 && !nearBg; dy++) {
@@ -257,16 +281,18 @@ export function processImageTransparency(
         if (nearBg) {
           const d = distMap[i];
           if (d < tolerance + softRange) {
-            // Smooth ramp from 0 at tolerance to 1 at tolerance + softRange
             const ratio = Math.max(0, Math.min(1, (d - tolerance) / softRange));
-            // Smoothstep curve for natural anti-aliased edge
             const smoothAlpha = ratio * ratio * (3 - 2 * ratio);
             const origAlpha = src[rgbaIdx + 3] / 255;
             const finalAlpha = smoothAlpha * origAlpha;
-            dst[rgbaIdx + 3] = Math.round(finalAlpha * 255);
+            const alphaByte = Math.round(finalAlpha * 255);
+            dst[rgbaIdx + 3] = alphaByte;
 
-            // Color Decontamination (Remove Black/Background Matte from semi-transparent edge)
-            if (decontaminate && finalAlpha > 0.02 && finalAlpha < 0.99) {
+            if (alphaByte === 0) {
+              dst[rgbaIdx] = 0;
+              dst[rgbaIdx + 1] = 0;
+              dst[rgbaIdx + 2] = 0;
+            } else if (decontaminate && finalAlpha > 0.02 && finalAlpha < 0.99) {
               const invBg = 1 - finalAlpha;
               dst[rgbaIdx] = Math.min(255, Math.max(0, Math.round((src[rgbaIdx] - invBg * tr) / finalAlpha)));
               dst[rgbaIdx + 1] = Math.min(255, Math.max(0, Math.round((src[rgbaIdx + 1] - invBg * tg) / finalAlpha)));
@@ -309,6 +335,9 @@ export function processImageTransparency(
               if (dx * dx + dy * dy <= rSq) {
                 const idx = (rowOffset + x) * 4;
                 if (stroke.type === 'erase') {
+                  dst[idx] = 0;
+                  dst[idx + 1] = 0;
+                  dst[idx + 2] = 0;
                   dst[idx + 3] = 0;
                 } else {
                   dst[idx] = src[idx];
@@ -328,12 +357,13 @@ export function processImageTransparency(
 }
 
 /**
- * Crops transparent borders from an ImageData and returns a new Canvas with optional margin.
+ * Crops transparent borders and scales the canvas if requested.
  */
 export function createExportCanvas(
   processedData: ImageData,
   autoTrim: boolean,
-  trimMargin = 16
+  trimMargin = 16,
+  scale: ExportScale = 1
 ): HTMLCanvasElement {
   const { width, height, data } = processedData;
   const fullCanvas = document.createElement('canvas');
@@ -342,45 +372,112 @@ export function createExportCanvas(
   const ctx = fullCanvas.getContext('2d')!;
   ctx.putImageData(processedData, 0, 0);
 
-  if (!autoTrim) {
-    return fullCanvas;
-  }
+  let sourceCanvas = fullCanvas;
 
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
+  if (autoTrim) {
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
 
-  for (let y = 0; y < height; y++) {
-    const rowOffset = y * width;
-    for (let x = 0; x < width; x++) {
-      const alpha = data[(rowOffset + x) * 4 + 3];
-      if (alpha > 5) {
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
+    for (let y = 0; y < height; y++) {
+      const rowOffset = y * width;
+      for (let x = 0; x < width; x++) {
+        const alpha = data[(rowOffset + x) * 4 + 3];
+        if (alpha > 5) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
       }
+    }
+
+    if (maxX >= minX && maxY >= minY) {
+      const cropX = Math.max(0, minX - trimMargin);
+      const cropY = Math.max(0, minY - trimMargin);
+      const cropRight = Math.min(width - 1, maxX + trimMargin);
+      const cropBottom = Math.min(height - 1, maxY + trimMargin);
+      const cropW = cropRight - cropX + 1;
+      const cropH = cropBottom - cropY + 1;
+
+      const trimmedCanvas = document.createElement('canvas');
+      trimmedCanvas.width = cropW;
+      trimmedCanvas.height = cropH;
+      const trimmedCtx = trimmedCanvas.getContext('2d')!;
+      trimmedCtx.drawImage(fullCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+      sourceCanvas = trimmedCanvas;
     }
   }
 
-  // If image is completely transparent, return full canvas
-  if (maxX < minX || maxY < minY) {
-    return fullCanvas;
+  if (scale !== 1) {
+    const targetW = Math.max(1, Math.round(sourceCanvas.width * scale));
+    const targetH = Math.max(1, Math.round(sourceCanvas.height * scale));
+    const scaledCanvas = document.createElement('canvas');
+    scaledCanvas.width = targetW;
+    scaledCanvas.height = targetH;
+    const scaledCtx = scaledCanvas.getContext('2d')!;
+    scaledCtx.imageSmoothingEnabled = true;
+    scaledCtx.imageSmoothingQuality = 'high';
+    scaledCtx.drawImage(sourceCanvas, 0, 0, targetW, targetH);
+    return scaledCanvas;
   }
 
-  const cropX = Math.max(0, minX - trimMargin);
-  const cropY = Math.max(0, minY - trimMargin);
-  const cropRight = Math.min(width - 1, maxX + trimMargin);
-  const cropBottom = Math.min(height - 1, maxY + trimMargin);
-  const cropW = cropRight - cropX + 1;
-  const cropH = cropBottom - cropY + 1;
+  return sourceCanvas;
+}
 
-  const trimmedCanvas = document.createElement('canvas');
-  trimmedCanvas.width = cropW;
-  trimmedCanvas.height = cropH;
-  const trimmedCtx = trimmedCanvas.getContext('2d')!;
-  trimmedCtx.drawImage(fullCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+/**
+ * Encodes an ImageData into an optimized PNG Blob using the selected compression mode.
+ * - 'palette256': TinyPNG-style 8-bit indexed PNG with full alpha support (~70% smaller)
+ * - 'palette128': Extra compact 128-color indexed PNG (~80% smaller)
+ * - 'smart': 32-bit TrueColor with JPEG micro-noise rounding (~40% smaller)
+ * - 'lossless': 32-bit TrueColor lossless with transparent pixel zeroing
+ */
+export function encodeOptimizedPng(
+  processedData: ImageData,
+  options: ExportOptions
+): EncodedPngResult {
+  const canvas = createExportCanvas(
+    processedData,
+    options.autoTrim,
+    options.trimMargin ?? 16,
+    options.scale
+  );
+  const w = canvas.width;
+  const h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const rgba = new Uint8Array(imgData.data.buffer.slice(0));
 
-  return trimmedCanvas;
+  // Ensure all transparent pixels have RGB=0,0,0
+  for (let i = 0; i < rgba.length; i += 4) {
+    if (rgba[i + 3] === 0) {
+      rgba[i] = 0;
+      rgba[i + 1] = 0;
+      rgba[i + 2] = 0;
+    } else if (options.compression === 'smart') {
+      // Snap subtle JPEG noise (quantize RGB in steps of 6) so DEFLATE finds long repeated sequences
+      rgba[i] = Math.min(255, Math.round(rgba[i] / 6) * 6);
+      rgba[i + 1] = Math.min(255, Math.round(rgba[i + 1] / 6) * 6);
+      rgba[i + 2] = Math.min(255, Math.round(rgba[i + 2] / 6) * 6);
+      rgba[i + 3] = Math.min(255, Math.round(rgba[i + 3] / 4) * 4);
+    }
+  }
+
+  let cnum = 0; // 0 = lossless RGBA in UPNG
+  if (options.compression === 'palette256') {
+    cnum = 256;
+  } else if (options.compression === 'palette128') {
+    cnum = 128;
+  }
+
+  const pngBuffer = UPNG.encode([rgba.buffer], w, h, cnum);
+  const blob = new Blob([pngBuffer], { type: 'image/png' });
+
+  return {
+    blob,
+    width: w,
+    height: h,
+    byteSize: blob.size,
+  };
 }

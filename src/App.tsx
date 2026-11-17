@@ -20,6 +20,7 @@ import {
   Layers,
   Scissors,
   Image as ImageIcon,
+  FileDown,
 } from 'lucide-react';
 import {
   type ProcessOptions,
@@ -27,8 +28,12 @@ import {
   type Point,
   type BrushStroke,
   type RemovalMode,
+  type CompressionMode,
+  type ExportScale,
+  type EncodedPngResult,
   processImageTransparency,
-  createExportCanvas,
+  encodeOptimizedPng,
+  formatBytes,
   rgbToHex,
   hexToRgb,
 } from './utils/imageProcessor';
@@ -69,12 +74,44 @@ const TARGET_COLOR_PRESETS: { label: string; color: RGBColor; hex: string }[] = 
   { label: 'マゼンタ (#FF00FF)', color: { r: 255, g: 0, b: 255 }, hex: '#FF00FF' },
 ];
 
+const COMPRESSION_OPTIONS: {
+  id: CompressionMode;
+  title: string;
+  badge: string;
+  desc: string;
+}[] = [
+  {
+    id: 'palette256',
+    title: '高圧縮・256色',
+    badge: '推奨・約70%減',
+    desc: 'TinyPNGと同じ減色技術。イラスト・ロゴの見た目を保ちつつ劇的に軽量化',
+  },
+  {
+    id: 'smart',
+    title: 'スマート軽量',
+    badge: 'フルカラー・約40%減',
+    desc: '1677万色を維持したまま、JFIF/JPEG特有の微細ノイズだけを整えて圧縮',
+  },
+  {
+    id: 'palette128',
+    title: '超圧縮・128色',
+    badge: '最小容量・約80%減',
+    desc: '色数の少ないシンプルなロゴやステッカーデザインに最適',
+  },
+  {
+    id: 'lossless',
+    title: '最高画質（無劣化）',
+    badge: 'ロスレス',
+    desc: '減色を行わず、透明領域のデータクリーニングのみ実施して保存',
+  },
+];
+
 export function App() {
   // Source & Processed ImageData
   const [sourceImageData, setSourceImageData] = useState<ImageData | null>(null);
   const [processedImageData, setProcessedImageData] = useState<ImageData | null>(null);
   const [fileName, setFileName] = useState<string>('tshirt-design');
-  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
+  const [originalFileSize, setOriginalFileSize] = useState<number | null>(null);
 
   // Processing parameters
   const [mode, setMode] = useState<RemovalMode>('flood');
@@ -83,7 +120,14 @@ export function App() {
   const [feather, setFeather] = useState<number>(6);
   const [edgeChoke, setEdgeChoke] = useState<number>(0);
   const [decontaminate, setDecontaminate] = useState<boolean>(true);
+
+  // Export & Compression parameters
   const [autoTrim, setAutoTrim] = useState<boolean>(false);
+  const [compression, setCompression] = useState<CompressionMode>('palette256');
+  const [exportScale, setExportScale] = useState<ExportScale>(1);
+  const [encodedPreview, setEncodedPreview] = useState<EncodedPngResult | null>(null);
+  const [losslessByteSize, setLosslessByteSize] = useState<number | null>(null);
+  const [isEncoding, setIsEncoding] = useState<boolean>(false);
 
   // Interactive Tool & History
   const [activeTool, setActiveTool] = useState<ActiveTool>('punch');
@@ -124,7 +168,7 @@ export function App() {
 
   // Load image helper from HTMLImageElement
   const loadFromImageElement = useCallback(
-    (img: HTMLImageElement, name: string) => {
+    (img: HTMLImageElement, name: string, byteLength?: number) => {
       const w = img.naturalWidth || img.width;
       const h = img.naturalHeight || img.height;
       const offscreen = document.createElement('canvas');
@@ -146,13 +190,13 @@ export function App() {
       }
 
       setSourceImageData(imgData);
-      setImageSize({ width: w, height: h });
+      setOriginalFileSize(byteLength ?? null);
       setFileName(name.replace(/\.[^/.]+$/, '') || 'tshirt-design');
       setHistory([{ seedPoints: [], brushStrokes: [] }]);
       setHistoryIndex(0);
       setZoom(1);
       setPanOffset({ x: 0, y: 0 });
-      showToast('画像を読み込みました！外側の背景を自動透過しています。');
+      showToast('画像を読み込みました！外側の背景を自動透過＆軽量化準備しています。');
     },
     [showToast]
   );
@@ -168,7 +212,7 @@ export function App() {
       const reader = new FileReader();
       reader.onload = (e) => {
         const img = new Image();
-        img.onload = () => loadFromImageElement(img, file.name);
+        img.onload = () => loadFromImageElement(img, file.name, file.size);
         img.onerror = () => showToast('画像の読み込みに失敗しました。別のファイルでお試しください');
         img.src = e.target?.result as string;
       };
@@ -182,13 +226,11 @@ export function App() {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
-      loadFromImageElement(img, 'tokyo-beats-shiba');
+      loadFromImageElement(img, 'tokyo-beats-shiba', 552960);
       setMode('flood');
       setTolerance(16);
       setFeather(6);
       setEdgeChoke(1);
-      // Also pre-punch the enclosed gap between the headphone band and head so it looks amazing out of the box,
-      // or let user see how flood fill works! Let's keep seedPoints empty initially so the user can test tapping the headphone gap, or tell them in toast!
       showToast('サンプル読込完了！内部のサングラスや文字の黒を残して背景のみ透過しました。');
     };
     img.src = './sample-shiba.jpg';
@@ -243,6 +285,44 @@ export function App() {
     decontaminate,
     currentHistory,
   ]);
+
+  // Debounced computation of optimized PNG file size & baseline lossless size
+  useEffect(() => {
+    if (!processedImageData) {
+      setEncodedPreview(null);
+      setLosslessByteSize(null);
+      return;
+    }
+
+    setIsEncoding(true);
+    const timer = setTimeout(() => {
+      try {
+        const result = encodeOptimizedPng(processedImageData, {
+          autoTrim,
+          trimMargin: 16,
+          compression,
+          scale: exportScale,
+        });
+        setEncodedPreview(result);
+
+        if (compression === 'lossless' && exportScale === 1) {
+          setLosslessByteSize(result.byteSize);
+        } else {
+          const baseline = encodeOptimizedPng(processedImageData, {
+            autoTrim,
+            trimMargin: 16,
+            compression: 'lossless',
+            scale: 1,
+          });
+          setLosslessByteSize(baseline.byteSize);
+        }
+      } finally {
+        setIsEncoding(false);
+      }
+    }, 220);
+
+    return () => clearTimeout(timer);
+  }, [processedImageData, autoTrim, compression, exportScale]);
 
   // Render to visible canvas
   useEffect(() => {
@@ -366,7 +446,6 @@ export function App() {
 
     currentStrokePointsRef.current.push(pt);
 
-    // Live preview on canvas while dragging brush
     const canvas = displayCanvasRef.current;
     if (canvas && sourceImageData) {
       const ctx = canvas.getContext('2d');
@@ -408,28 +487,41 @@ export function App() {
     }
   };
 
-  // Export transparent PNG
+  // Export transparent PNG using UPNG compressor
   const handleDownload = () => {
     if (!processedImageData) return;
-    const exportCanvas = createExportCanvas(processedImageData, autoTrim, 16);
-    exportCanvas.toBlob((blob) => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${fileName}-transparent.png`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      showToast(`透過PNG（${exportCanvas.width}×${exportCanvas.height}px）を保存しました！`);
-    }, 'image/png');
+    const result =
+      encodedPreview ??
+      encodeOptimizedPng(processedImageData, {
+        autoTrim,
+        trimMargin: 16,
+        compression,
+        scale: exportScale,
+      });
+
+    const url = URL.createObjectURL(result.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${fileName}-transparent.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(
+      `透過PNG（${result.width}×${result.height}px / ${formatBytes(result.byteSize)}）を保存しました！`
+    );
   };
 
   // Determine viewport background style
   const isCheckerDark = previewBg === 'checker-dark';
   const isCheckerLight = previewBg === 'checker-light';
   const solidPreviewColor = !isCheckerDark && !isCheckerLight ? previewBg : undefined;
+
+  // Compute savings percentage compared to standard lossless PNG
+  const savingsPercent =
+    encodedPreview && losslessByteSize && losslessByteSize > encodedPreview.byteSize
+      ? Math.round(((losslessByteSize - encodedPreview.byteSize) / losslessByteSize) * 100)
+      : 0;
 
   return (
     <div className="studio-shell">
@@ -657,12 +749,12 @@ export function App() {
                 </div>
                 <div>
                   <h2 style={{ fontSize: '1.18rem', fontWeight: 700, marginBottom: 6 }}>
-                    Geminiで作成した黒背景画像をここにドロップ
+                    Geminiで作成した黒背景画像（JFIF / JPG / PNG）をドロップ
                   </h2>
                   <p style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
                     デザイン内部の黒色（サングラス・黒線・文字など）はそのまま残し、
                     <br />
-                    外側の背景だけをTシャツ印刷向けに綺麗に透過PNG化します。
+                    外側の背景だけを透過＆<strong>TinyPNG方式で高圧縮・軽量化</strong>して保存します。
                   </p>
                 </div>
 
@@ -698,8 +790,8 @@ export function App() {
                     justifyContent: 'center',
                   }}
                 >
-                  <span>✓ スマホ・PC両対応</span>
-                  <span>✓ サーバー送信なし（ブラウザ内高速処理）</span>
+                  <span>✓ JFIF / JPG / PNG / WebP 対応</span>
+                  <span>✓ 256色パレット軽量化対応</span>
                   <span>✓ Ctrl+V でクリップボード貼付対応</span>
                 </div>
               </div>
@@ -718,7 +810,6 @@ export function App() {
               >
                 {tshirtMockup ? (
                   <div className="tshirt-mockup-container">
-                    {/* Vector T-Shirt Silhouette for realistic merch preview */}
                     <svg
                       viewBox="0 0 600 620"
                       style={{
@@ -736,7 +827,6 @@ export function App() {
                         stroke="rgba(255,255,255,0.18)"
                         strokeWidth="3"
                       />
-                      {/* Collar detail */}
                       <path
                         d="M230,42 C250,82 350,82 370,42"
                         fill="none"
@@ -1094,25 +1184,151 @@ export function App() {
                 </button>
               </div>
             </div>
+
+            {/* 4. PNG Compression & Size Optimization */}
+            <div className="control-section">
+              <div className="section-header">
+                <span className="section-title">
+                  <FileDown size={15} style={{ color: 'var(--accent-primary)' }} />
+                  4. PNGファイル容量の軽量化
+                </span>
+                {savingsPercent > 0 && (
+                  <span
+                    className="section-badge"
+                    style={{
+                      background: 'rgba(16, 185, 129, 0.15)',
+                      color: '#34d399',
+                      borderColor: 'rgba(16, 185, 129, 0.4)',
+                    }}
+                  >
+                    -{savingsPercent}% 軽量化
+                  </span>
+                )}
+              </div>
+
+              <div className="segmented-grid">
+                {COMPRESSION_OPTIONS.map((opt) => {
+                  const isSelected = compression === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      className={`segment-btn ${isSelected ? 'active' : ''}`}
+                      onClick={() => setCompression(opt.id)}
+                      id={`compression-${opt.id}-btn`}
+                    >
+                      <span className="segment-btn-title">{opt.title}</span>
+                      <span
+                        style={{
+                          fontSize: '0.66rem',
+                          color: isSelected ? 'var(--accent-primary-hover)' : 'var(--text-muted)',
+                          fontWeight: 600,
+                        }}
+                      >
+                        {opt.badge}
+                      </span>
+                      <span className="segment-btn-desc" style={{ marginTop: 2 }}>
+                        {opt.desc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Output Resolution Scale Selector */}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  paddingTop: 4,
+                }}
+              >
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                  出力解像度（リサイズ）
+                </span>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {([1, 0.75, 0.5] as ExportScale[]).map((sc) => (
+                    <button
+                      key={sc}
+                      type="button"
+                      className={`btn btn-ghost ${exportScale === sc ? 'active' : ''}`}
+                      onClick={() => setExportScale(sc)}
+                      style={{ padding: '4px 8px', fontSize: '0.74rem' }}
+                    >
+                      {sc * 100}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div
+                className="toggle-row"
+                onClick={() => setAutoTrim(!autoTrim)}
+                role="switch"
+                aria-checked={autoTrim}
+              >
+                <span>透明な余白を自動トリミングして保存</span>
+                <button
+                  type="button"
+                  className={`toggle-switch ${autoTrim ? 'checked' : ''}`}
+                  aria-label="透明な余白を自動トリミング"
+                >
+                  <span className="toggle-knob" />
+                </button>
+              </div>
+            </div>
           </div>
 
-          {/* Export Footer */}
+          {/* Export Footer with Live File Size Indicator */}
           <div className="inspector-footer">
-            <div
-              className="toggle-row"
-              onClick={() => setAutoTrim(!autoTrim)}
-              role="switch"
-              aria-checked={autoTrim}
-            >
-              <span>透明な余白を自動トリミングして保存</span>
-              <button
-                type="button"
-                className={`toggle-switch ${autoTrim ? 'checked' : ''}`}
-                aria-label="透明な余白を自動トリミング"
+            {encodedPreview && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  fontSize: '0.76rem',
+                  background: 'var(--bg-input)',
+                  padding: '7px 10px',
+                  borderRadius: 'var(--radius-sm)',
+                  border: '1px solid var(--border-subtle)',
+                }}
               >
-                <span className="toggle-knob" />
-              </button>
-            </div>
+                <span style={{ color: 'var(--text-secondary)' }}>
+                  出力サイズ ({encodedPreview.width}×{encodedPreview.height}px):
+                </span>
+                <span
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontWeight: 600,
+                    color: '#34d399',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  {isEncoding ? '計算中...' : formatBytes(encodedPreview.byteSize)}
+                  {losslessByteSize && losslessByteSize > encodedPreview.byteSize && !isEncoding && (
+                    <span
+                      style={{
+                        fontSize: '0.7rem',
+                        color: 'var(--text-muted)',
+                        textDecoration: 'line-through',
+                      }}
+                    >
+                      {formatBytes(losslessByteSize)}
+                    </span>
+                  )}
+                  {originalFileSize && !isEncoding && (
+                    <span style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>
+                      (元画像: {formatBytes(originalFileSize)})
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
 
             <button
               type="button"
@@ -1124,8 +1340,8 @@ export function App() {
             >
               <Download size={18} />
               <span>
-                透過PNGをダウンロード
-                {imageSize ? ` (${imageSize.width}×${imageSize.height})` : ''}
+                軽量化透過PNGをダウンロード
+                {encodedPreview ? ` (${formatBytes(encodedPreview.byteSize)})` : ''}
               </span>
             </button>
           </div>

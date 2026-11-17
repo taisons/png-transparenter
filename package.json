@@ -12,7 +12,8 @@
   "dependencies": {
     "lucide-react": "^1.73.0",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "upng-js": "^2.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
