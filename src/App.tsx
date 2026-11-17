@@ -159,14 +159,17 @@ export function App() {
 
   const handleFileSelect = useCallback(
     (file: File) => {
-      if (!file.type.startsWith('image/')) {
-        showToast('画像ファイル（PNG / JPG / WebP）を選択してください');
+      const isImageMime = file.type.startsWith('image/');
+      const isImageExt = /\.(jfif|jpe|jpeg|jpg|png|webp|avif|bmp|gif|svg)$/i.test(file.name);
+      if (!isImageMime && !isImageExt) {
+        showToast('画像ファイル（JFIF / JPG / PNG / WebP など）を選択してください');
         return;
       }
       const reader = new FileReader();
       reader.onload = (e) => {
         const img = new Image();
         img.onload = () => loadFromImageElement(img, file.name);
+        img.onerror = () => showToast('画像の読み込みに失敗しました。別のファイルでお試しください');
         img.src = e.target?.result as string;
       };
       reader.readAsDataURL(file);
@@ -470,7 +473,7 @@ export function App() {
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,.jfif,.jpe,.jpg,.jpeg,.png,.webp,.avif,.bmp"
             style={{ display: 'none' }}
             onChange={(e) => {
               const file = e.target.files?.[0];
