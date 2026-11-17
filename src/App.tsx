@@ -21,6 +21,7 @@ import {
   Scissors,
   Image as ImageIcon,
   FileDown,
+  Maximize2,
 } from 'lucide-react';
 import {
   type ProcessOptions,
@@ -29,7 +30,9 @@ import {
   type BrushStroke,
   type RemovalMode,
   type CompressionMode,
-  type ExportScale,
+  type ResizePreset,
+  type AspectFitMode,
+  type VerticalAlign,
   type EncodedPngResult,
   processImageTransparency,
   encodeOptimizedPng,
@@ -72,6 +75,50 @@ const TARGET_COLOR_PRESETS: { label: string; color: RGBColor; hex: string }[] = 
   { label: '白 (#FFFFFF)', color: { r: 255, g: 255, b: 255 }, hex: '#FFFFFF' },
   { label: 'グリーン (#00FF00)', color: { r: 0, g: 255, b: 0 }, hex: '#00FF00' },
   { label: 'マゼンタ (#FF00FF)', color: { r: 255, g: 0, b: 255 }, hex: '#FF00FF' },
+];
+
+const RESIZE_OPTIONS: {
+  id: ResizePreset;
+  title: string;
+  badge: string;
+  desc: string;
+}[] = [
+  {
+    id: '3:4_2000',
+    title: '3:4（1500×2000px）',
+    badge: '長辺2000px・Tシャツ標準',
+    desc: '縦横比3:4・長辺2000px（幅1500×高さ2000px）で出力します',
+  },
+  {
+    id: 'orig_2000',
+    title: '元比率で長辺2000px',
+    badge: '長辺2000px',
+    desc: '元画像のアスペクト比を維持したまま長辺を2000pxにリサイズ',
+  },
+  {
+    id: '1:1_2000',
+    title: '1:1（2000×2000px）',
+    badge: '正方形・2000px',
+    desc: '正方形（2000×2000px）にリサイズして出力します',
+  },
+  {
+    id: '4:3_2000',
+    title: '4:3（2000×1500px）',
+    badge: '横長・長辺2000px',
+    desc: '横長4:3・長辺2000px（幅2000×高さ1500px）で出力します',
+  },
+  {
+    id: 'custom',
+    title: 'カスタムサイズ指定',
+    badge: '自由入力',
+    desc: '任意のアスペクト比と長辺ピクセル数を指定します',
+  },
+  {
+    id: 'none',
+    title: 'リサイズなし',
+    badge: '元サイズ維持',
+    desc: '元画像のピクセル解像度のまま出力します',
+  },
 ];
 
 const COMPRESSION_OPTIONS: {
@@ -121,10 +168,17 @@ export function App() {
   const [edgeChoke, setEdgeChoke] = useState<number>(0);
   const [decontaminate, setDecontaminate] = useState<boolean>(true);
 
-  // Export & Compression parameters
-  const [autoTrim, setAutoTrim] = useState<boolean>(false);
+  // Resize & Aspect Ratio parameters (Default to 3:4 with long edge 2000px = 1500x2000px)
+  const [resizePreset, setResizePreset] = useState<ResizePreset>('3:4_2000');
+  const [fitMode, setFitMode] = useState<AspectFitMode>('contain');
+  const [verticalAlign, setVerticalAlign] = useState<VerticalAlign>('center');
+  const [customLongEdge, setCustomLongEdge] = useState<number>(2000);
+  const [customAspectW, setCustomAspectW] = useState<number>(3);
+  const [customAspectH, setCustomAspectH] = useState<number>(4);
+  const [autoTrim, setAutoTrim] = useState<boolean>(true);
+
+  // Compression parameters
   const [compression, setCompression] = useState<CompressionMode>('palette256');
-  const [exportScale, setExportScale] = useState<ExportScale>(1);
   const [encodedPreview, setEncodedPreview] = useState<EncodedPngResult | null>(null);
   const [losslessByteSize, setLosslessByteSize] = useState<number | null>(null);
   const [isEncoding, setIsEncoding] = useState<boolean>(false);
@@ -196,7 +250,7 @@ export function App() {
       setHistoryIndex(0);
       setZoom(1);
       setPanOffset({ x: 0, y: 0 });
-      showToast('画像を読み込みました！外側の背景を自動透過＆軽量化準備しています。');
+      showToast('画像を読み込みました！外側の背景を自動透過＆3:4(1500×2000px)出力準備完了です。');
     },
     [showToast]
   );
@@ -231,7 +285,7 @@ export function App() {
       setTolerance(16);
       setFeather(6);
       setEdgeChoke(1);
-      showToast('サンプル読込完了！内部のサングラスや文字の黒を残して背景のみ透過しました。');
+      showToast('サンプル読込完了！内部の黒を残して透過し、3:4（1500×2000px）出力に設定しています。');
     };
     img.src = './sample-shiba.jpg';
   }, [loadFromImageElement, showToast]);
@@ -297,22 +351,26 @@ export function App() {
     setIsEncoding(true);
     const timer = setTimeout(() => {
       try {
-        const result = encodeOptimizedPng(processedImageData, {
+        const exportOpts = {
           autoTrim,
-          trimMargin: 16,
+          trimMargin: 24,
           compression,
-          scale: exportScale,
-        });
+          resizePreset,
+          customLongEdge,
+          customAspectW,
+          customAspectH,
+          fitMode,
+          verticalAlign,
+        };
+        const result = encodeOptimizedPng(processedImageData, exportOpts);
         setEncodedPreview(result);
 
-        if (compression === 'lossless' && exportScale === 1) {
+        if (compression === 'lossless') {
           setLosslessByteSize(result.byteSize);
         } else {
           const baseline = encodeOptimizedPng(processedImageData, {
-            autoTrim,
-            trimMargin: 16,
+            ...exportOpts,
             compression: 'lossless',
-            scale: 1,
           });
           setLosslessByteSize(baseline.byteSize);
         }
@@ -322,7 +380,17 @@ export function App() {
     }, 220);
 
     return () => clearTimeout(timer);
-  }, [processedImageData, autoTrim, compression, exportScale]);
+  }, [
+    processedImageData,
+    autoTrim,
+    compression,
+    resizePreset,
+    customLongEdge,
+    customAspectW,
+    customAspectH,
+    fitMode,
+    verticalAlign,
+  ]);
 
   // Render to visible canvas
   useEffect(() => {
@@ -487,22 +555,27 @@ export function App() {
     }
   };
 
-  // Export transparent PNG using UPNG compressor
+  // Export transparent PNG using UPNG compressor & resize settings
   const handleDownload = () => {
     if (!processedImageData) return;
     const result =
       encodedPreview ??
       encodeOptimizedPng(processedImageData, {
         autoTrim,
-        trimMargin: 16,
+        trimMargin: 24,
         compression,
-        scale: exportScale,
+        resizePreset,
+        customLongEdge,
+        customAspectW,
+        customAspectH,
+        fitMode,
+        verticalAlign,
       });
 
     const url = URL.createObjectURL(result.blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${fileName}-transparent.png`;
+    a.download = `${fileName}-${result.width}x${result.height}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -522,6 +595,12 @@ export function App() {
     encodedPreview && losslessByteSize && losslessByteSize > encodedPreview.byteSize
       ? Math.round(((losslessByteSize - encodedPreview.byteSize) / losslessByteSize) * 100)
       : 0;
+
+  const isFixedAspectPreset =
+    resizePreset === '3:4_2000' ||
+    resizePreset === '4:3_2000' ||
+    resizePreset === '1:1_2000' ||
+    resizePreset === 'custom';
 
   return (
     <div className="studio-shell">
@@ -752,9 +831,9 @@ export function App() {
                     Geminiで作成した黒背景画像（JFIF / JPG / PNG）をドロップ
                   </h2>
                   <p style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                    デザイン内部の黒色（サングラス・黒線・文字など）はそのまま残し、
+                    デザイン内部の黒色はそのまま残し、外側の背景だけを透過。
                     <br />
-                    外側の背景だけを透過＆<strong>TinyPNG方式で高圧縮・軽量化</strong>して保存します。
+                    <strong>3:4（1500×2000px / 長辺2000px）リサイズ＆軽量化</strong>して保存します。
                   </p>
                 </div>
 
@@ -790,9 +869,9 @@ export function App() {
                     justifyContent: 'center',
                   }}
                 >
-                  <span>✓ JFIF / JPG / PNG / WebP 対応</span>
+                  <span>✓ 3:4（1500×2000px）出力標準対応</span>
+                  <span>✓ JFIF / JPG / PNG 対応</span>
                   <span>✓ 256色パレット軽量化対応</span>
-                  <span>✓ Ctrl+V でクリップボード貼付対応</span>
                 </div>
               </div>
             ) : (
@@ -1113,7 +1192,6 @@ export function App() {
                 </span>
               </div>
 
-              {/* Tolerance Slider */}
               <div className="slider-row">
                 <div className="slider-header">
                   <span className="slider-label">黒色の許容度（しきい値）</span>
@@ -1131,7 +1209,6 @@ export function App() {
                 />
               </div>
 
-              {/* Feather / Soft Edge Slider */}
               <div className="slider-row">
                 <div className="slider-header">
                   <span className="slider-label">境界のなめらかさ（アンチエイリアス）</span>
@@ -1149,7 +1226,6 @@ export function App() {
                 />
               </div>
 
-              {/* Edge Choke Slider */}
               <div className="slider-row">
                 <div className="slider-header">
                   <span className="slider-label">フチ削り（白Tシャツでの黒フチ残り対策）</span>
@@ -1167,7 +1243,6 @@ export function App() {
                 />
               </div>
 
-              {/* Color Decontamination Toggle */}
               <div
                 className="toggle-row"
                 onClick={() => setDecontaminate(!decontaminate)}
@@ -1185,12 +1260,229 @@ export function App() {
               </div>
             </div>
 
-            {/* 4. PNG Compression & Size Optimization */}
+            {/* 4. Image Resize & Aspect Ratio (3:4 1500x2000px default) */}
+            <div className="control-section">
+              <div className="section-header">
+                <span className="section-title">
+                  <Maximize2 size={15} style={{ color: 'var(--accent-primary)' }} />
+                  4. 出力リサイズ・アスペクト比
+                </span>
+                <span className="section-badge">
+                  {encodedPreview
+                    ? `${encodedPreview.width}×${encodedPreview.height}px`
+                    : '1500×2000px (3:4)'}
+                </span>
+              </div>
+
+              <div className="segmented-grid">
+                {RESIZE_OPTIONS.map((opt) => {
+                  const isSelected = resizePreset === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      className={`segment-btn ${isSelected ? 'active' : ''}`}
+                      onClick={() => setResizePreset(opt.id)}
+                      id={`resize-${opt.id}-btn`}
+                    >
+                      <span className="segment-btn-title">{opt.title}</span>
+                      <span
+                        style={{
+                          fontSize: '0.66rem',
+                          color: isSelected ? 'var(--accent-primary-hover)' : 'var(--text-muted)',
+                          fontWeight: 600,
+                        }}
+                      >
+                        {opt.badge}
+                      </span>
+                      <span className="segment-btn-desc" style={{ marginTop: 2 }}>
+                        {opt.desc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Custom Long Edge & Aspect Ratio Inputs */}
+              {resizePreset === 'custom' && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 1fr 1fr',
+                    gap: 8,
+                    background: 'var(--bg-input)',
+                    padding: 10,
+                    borderRadius: 'var(--radius-sm)',
+                    border: '1px solid var(--border-subtle)',
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
+                      長辺 (px)
+                    </label>
+                    <input
+                      type="number"
+                      min={100}
+                      max={8000}
+                      value={customLongEdge}
+                      onChange={(e) => setCustomLongEdge(Number(e.target.value) || 2000)}
+                      style={{
+                        background: 'var(--bg-panel)',
+                        border: '1px solid var(--border-strong)',
+                        borderRadius: 4,
+                        padding: '5px 8px',
+                        fontSize: '0.8rem',
+                        width: '100%',
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
+                      横比率 (W)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={customAspectW}
+                      onChange={(e) => setCustomAspectW(Number(e.target.value) || 3)}
+                      style={{
+                        background: 'var(--bg-panel)',
+                        border: '1px solid var(--border-strong)',
+                        borderRadius: 4,
+                        padding: '5px 8px',
+                        fontSize: '0.8rem',
+                        width: '100%',
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
+                      縦比率 (H)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={customAspectH}
+                      onChange={(e) => setCustomAspectH(Number(e.target.value) || 4)}
+                      style={{
+                        background: 'var(--bg-panel)',
+                        border: '1px solid var(--border-strong)',
+                        borderRadius: 4,
+                        padding: '5px 8px',
+                        fontSize: '0.8rem',
+                        width: '100%',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Aspect Fit Mode & Vertical Alignment when a target ratio like 3:4 is selected */}
+              {isFixedAspectPreset && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 2 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 6,
+                    }}
+                  >
+                    <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                      比率変換時の配置方法
+                    </span>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <button
+                        type="button"
+                        className={`btn btn-ghost ${fitMode === 'contain' ? 'active' : ''}`}
+                        onClick={() => setFitMode('contain')}
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        title="イラストが縦横に潰れないよう、比率を保ったまま3:4の透明枠内に収めます"
+                      >
+                        歪みなしフィット
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn btn-ghost ${fitMode === 'cover' ? 'active' : ''}`}
+                        onClick={() => setFitMode('cover')}
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        title="枠いっぱいに拡大して中央で切り抜きます"
+                      >
+                        切り抜き
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn btn-ghost ${fitMode === 'stretch' ? 'active' : ''}`}
+                        onClick={() => setFitMode('stretch')}
+                        style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        title="縦横比を強制的に3:4へ引き伸ばします"
+                      >
+                        引き伸ばし
+                      </button>
+                    </div>
+                  </div>
+
+                  {fitMode === 'contain' && (
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 6,
+                      }}
+                    >
+                      <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                        縦方向の配置位置
+                      </span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button
+                          type="button"
+                          className={`btn btn-ghost ${verticalAlign === 'center' ? 'active' : ''}`}
+                          onClick={() => setVerticalAlign('center')}
+                          style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                        >
+                          上下中央
+                        </button>
+                        <button
+                          type="button"
+                          className={`btn btn-ghost ${verticalAlign === 'top' ? 'active' : ''}`}
+                          onClick={() => setVerticalAlign('top')}
+                          style={{ padding: '4px 8px', fontSize: '0.72rem' }}
+                          title="Tシャツの胸元あたりにデザインが来るようやや上寄りに配置します"
+                        >
+                          やや上寄せ（胸元用）
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div
+                className="toggle-row"
+                onClick={() => setAutoTrim(!autoTrim)}
+                role="switch"
+                aria-checked={autoTrim}
+              >
+                <span>周囲の透明余白をカットしてからリサイズ枠に合わせる</span>
+                <button
+                  type="button"
+                  className={`toggle-switch ${autoTrim ? 'checked' : ''}`}
+                  aria-label="透明な余白を自動トリミング"
+                >
+                  <span className="toggle-knob" />
+                </button>
+              </div>
+            </div>
+
+            {/* 5. PNG Compression & Size Optimization */}
             <div className="control-section">
               <div className="section-header">
                 <span className="section-title">
                   <FileDown size={15} style={{ color: 'var(--accent-primary)' }} />
-                  4. PNGファイル容量の軽量化
+                  5. PNGファイル容量の軽量化
                 </span>
                 {savingsPercent > 0 && (
                   <span
@@ -1234,50 +1526,6 @@ export function App() {
                   );
                 })}
               </div>
-
-              {/* Output Resolution Scale Selector */}
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 8,
-                  paddingTop: 4,
-                }}
-              >
-                <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                  出力解像度（リサイズ）
-                </span>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  {([1, 0.75, 0.5] as ExportScale[]).map((sc) => (
-                    <button
-                      key={sc}
-                      type="button"
-                      className={`btn btn-ghost ${exportScale === sc ? 'active' : ''}`}
-                      onClick={() => setExportScale(sc)}
-                      style={{ padding: '4px 8px', fontSize: '0.74rem' }}
-                    >
-                      {sc * 100}%
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div
-                className="toggle-row"
-                onClick={() => setAutoTrim(!autoTrim)}
-                role="switch"
-                aria-checked={autoTrim}
-              >
-                <span>透明な余白を自動トリミングして保存</span>
-                <button
-                  type="button"
-                  className={`toggle-switch ${autoTrim ? 'checked' : ''}`}
-                  aria-label="透明な余白を自動トリミング"
-                >
-                  <span className="toggle-knob" />
-                </button>
-              </div>
             </div>
           </div>
 
@@ -1297,7 +1545,7 @@ export function App() {
                 }}
               >
                 <span style={{ color: 'var(--text-secondary)' }}>
-                  出力サイズ ({encodedPreview.width}×{encodedPreview.height}px):
+                  出力: <strong>{encodedPreview.width}×{encodedPreview.height}px</strong>
                 </span>
                 <span
                   style={{
@@ -1323,7 +1571,7 @@ export function App() {
                   )}
                   {originalFileSize && !isEncoding && (
                     <span style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>
-                      (元画像: {formatBytes(originalFileSize)})
+                      (元: {formatBytes(originalFileSize)})
                     </span>
                   )}
                 </span>
@@ -1340,8 +1588,12 @@ export function App() {
             >
               <Download size={18} />
               <span>
-                軽量化透過PNGをダウンロード
-                {encodedPreview ? ` (${formatBytes(encodedPreview.byteSize)})` : ''}
+                透過PNGをダウンロード
+                {encodedPreview
+                  ? ` (${encodedPreview.width}×${encodedPreview.height} / ${formatBytes(
+                      encodedPreview.byteSize
+                    )})`
+                  : ''}
               </span>
             </button>
           </div>

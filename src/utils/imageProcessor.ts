@@ -15,7 +15,17 @@ export type RemovalMode = 'flood' | 'global';
 
 export type CompressionMode = 'lossless' | 'smart' | 'palette256' | 'palette128';
 
-export type ExportScale = 1 | 0.75 | 0.5;
+export type ResizePreset =
+  | '3:4_2000' // 1500 x 2000 px (3:4 aspect ratio, long edge 2000px)
+  | 'orig_2000' // Keep original aspect ratio, long edge 2000px
+  | '1:1_2000' // 2000 x 2000 px
+  | '4:3_2000' // 2000 x 1500 px
+  | 'none' // Original resolution
+  | 'custom'; // Custom long edge & aspect ratio
+
+export type AspectFitMode = 'contain' | 'cover' | 'stretch';
+
+export type VerticalAlign = 'center' | 'top';
 
 export interface BrushStroke {
   type: 'erase' | 'restore';
@@ -38,7 +48,12 @@ export interface ExportOptions {
   autoTrim: boolean;
   trimMargin?: number;
   compression: CompressionMode;
-  scale: ExportScale;
+  resizePreset: ResizePreset;
+  customLongEdge?: number; // default 2000
+  customAspectW?: number; // default 3
+  customAspectH?: number; // default 4
+  fitMode?: AspectFitMode; // 'contain' (preserve proportions) | 'cover' | 'stretch'
+  verticalAlign?: VerticalAlign; // 'center' | 'top' (for T-shirt chest placement)
 }
 
 export interface EncodedPngResult {
@@ -357,13 +372,71 @@ export function processImageTransparency(
 }
 
 /**
- * Crops transparent borders and scales the canvas if requested.
+ * Resolve target width & height from ResizePreset and source dimensions.
+ */
+export function resolveTargetDimensions(
+  srcW: number,
+  srcH: number,
+  options: ExportOptions
+): { width: number; height: number } {
+  const { resizePreset, customLongEdge = 2000, customAspectW = 3, customAspectH = 4 } = options;
+
+  if (resizePreset === 'none') {
+    return { width: srcW, height: srcH };
+  }
+
+  if (resizePreset === '3:4_2000') {
+    // 3:4 aspect ratio with long edge = 2000px => 1500 x 2000 px
+    return { width: 1500, height: 2000 };
+  }
+
+  if (resizePreset === '4:3_2000') {
+    // 4:3 aspect ratio with long edge = 2000px => 2000 x 1500 px
+    return { width: 2000, height: 1500 };
+  }
+
+  if (resizePreset === '1:1_2000') {
+    return { width: 2000, height: 2000 };
+  }
+
+  if (resizePreset === 'orig_2000') {
+    const longEdge = 2000;
+    if (srcW >= srcH) {
+      return {
+        width: longEdge,
+        height: Math.max(1, Math.round((srcH / srcW) * longEdge)),
+      };
+    } else {
+      return {
+        width: Math.max(1, Math.round((srcW / srcH) * longEdge)),
+        height: longEdge,
+      };
+    }
+  }
+
+  // Custom long edge & aspect ratio
+  const long = Math.max(64, Math.min(8000, customLongEdge));
+  const aw = Math.max(1, customAspectW);
+  const ah = Math.max(1, customAspectH);
+  if (aw >= ah) {
+    return {
+      width: long,
+      height: Math.max(1, Math.round((ah / aw) * long)),
+    };
+  } else {
+    return {
+      width: Math.max(1, Math.round((aw / ah) * long)),
+      height: long,
+    };
+  }
+}
+
+/**
+ * Crops transparent borders (if requested) and resizes/frames onto the target aspect ratio canvas.
  */
 export function createExportCanvas(
   processedData: ImageData,
-  autoTrim: boolean,
-  trimMargin = 16,
-  scale: ExportScale = 1
+  options: ExportOptions
 ): HTMLCanvasElement {
   const { width, height, data } = processedData;
   const fullCanvas = document.createElement('canvas');
@@ -373,8 +446,9 @@ export function createExportCanvas(
   ctx.putImageData(processedData, 0, 0);
 
   let sourceCanvas = fullCanvas;
+  const trimMargin = options.trimMargin ?? 16;
 
-  if (autoTrim) {
+  if (options.autoTrim) {
     let minX = width;
     let minY = height;
     let maxX = -1;
@@ -410,39 +484,58 @@ export function createExportCanvas(
     }
   }
 
-  if (scale !== 1) {
-    const targetW = Math.max(1, Math.round(sourceCanvas.width * scale));
-    const targetH = Math.max(1, Math.round(sourceCanvas.height * scale));
-    const scaledCanvas = document.createElement('canvas');
-    scaledCanvas.width = targetW;
-    scaledCanvas.height = targetH;
-    const scaledCtx = scaledCanvas.getContext('2d')!;
-    scaledCtx.imageSmoothingEnabled = true;
-    scaledCtx.imageSmoothingQuality = 'high';
-    scaledCtx.drawImage(sourceCanvas, 0, 0, targetW, targetH);
-    return scaledCanvas;
+  if (options.resizePreset === 'none') {
+    return sourceCanvas;
   }
 
-  return sourceCanvas;
+  const target = resolveTargetDimensions(sourceCanvas.width, sourceCanvas.height, options);
+  const targetW = target.width;
+  const targetH = target.height;
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = targetW;
+  outCanvas.height = targetH;
+  const outCtx = outCanvas.getContext('2d')!;
+  outCtx.imageSmoothingEnabled = true;
+  outCtx.imageSmoothingQuality = 'high';
+
+  const fitMode = options.fitMode ?? 'contain';
+  const vAlign = options.verticalAlign ?? 'center';
+  const srcW = sourceCanvas.width;
+  const srcH = sourceCanvas.height;
+
+  if (fitMode === 'stretch' || options.resizePreset === 'orig_2000') {
+    outCtx.drawImage(sourceCanvas, 0, 0, targetW, targetH);
+  } else if (fitMode === 'cover') {
+    const scale = Math.max(targetW / srcW, targetH / srcH);
+    const drawW = Math.round(srcW * scale);
+    const drawH = Math.round(srcH * scale);
+    const offsetX = Math.round((targetW - drawW) / 2);
+    const offsetY =
+      vAlign === 'top' ? Math.round((targetH - drawH) * 0.15) : Math.round((targetH - drawH) / 2);
+    outCtx.drawImage(sourceCanvas, offsetX, offsetY, drawW, drawH);
+  } else {
+    // 'contain': Fit inside targetW x targetH without distorting the design
+    const scale = Math.min(targetW / srcW, targetH / srcH);
+    const drawW = Math.round(srcW * scale);
+    const drawH = Math.round(srcH * scale);
+    const offsetX = Math.round((targetW - drawW) / 2);
+    const offsetY =
+      vAlign === 'top' ? Math.round((targetH - drawH) * 0.12) : Math.round((targetH - drawH) / 2);
+    outCtx.drawImage(sourceCanvas, offsetX, offsetY, drawW, drawH);
+  }
+
+  return outCanvas;
 }
 
 /**
- * Encodes an ImageData into an optimized PNG Blob using the selected compression mode.
- * - 'palette256': TinyPNG-style 8-bit indexed PNG with full alpha support (~70% smaller)
- * - 'palette128': Extra compact 128-color indexed PNG (~80% smaller)
- * - 'smart': 32-bit TrueColor with JPEG micro-noise rounding (~40% smaller)
- * - 'lossless': 32-bit TrueColor lossless with transparent pixel zeroing
+ * Encodes an ImageData into an optimized PNG Blob using the selected resize & compression options.
  */
 export function encodeOptimizedPng(
   processedData: ImageData,
   options: ExportOptions
 ): EncodedPngResult {
-  const canvas = createExportCanvas(
-    processedData,
-    options.autoTrim,
-    options.trimMargin ?? 16,
-    options.scale
-  );
+  const canvas = createExportCanvas(processedData, options);
   const w = canvas.width;
   const h = canvas.height;
   const ctx = canvas.getContext('2d')!;
@@ -456,7 +549,6 @@ export function encodeOptimizedPng(
       rgba[i + 1] = 0;
       rgba[i + 2] = 0;
     } else if (options.compression === 'smart') {
-      // Snap subtle JPEG noise (quantize RGB in steps of 6) so DEFLATE finds long repeated sequences
       rgba[i] = Math.min(255, Math.round(rgba[i] / 6) * 6);
       rgba[i + 1] = Math.min(255, Math.round(rgba[i + 1] / 6) * 6);
       rgba[i + 2] = Math.min(255, Math.round(rgba[i + 2] / 6) * 6);
@@ -464,7 +556,7 @@ export function encodeOptimizedPng(
     }
   }
 
-  let cnum = 0; // 0 = lossless RGBA in UPNG
+  let cnum = 0;
   if (options.compression === 'palette256') {
     cnum = 256;
   } else if (options.compression === 'palette128') {
